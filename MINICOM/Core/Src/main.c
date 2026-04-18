@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stdbool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,18 +52,25 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
-uint8_t tx_buff[]="Hello World!\r\n";
-
+/*pc*/
+uint8_t RxChar;
+char RxBuffer[32];
+int RxIndex=0;
+bool CanTxFlag = false;
+bool CanRxFlag = false;
+uint32_t CanTxIde;
+uint32_t CanTxId;
+uint32_t CanTxDlc;
+uint32_t CanRxIde;
+uint32_t CanRxId;
+uint32_t CanRxDlc;
 
 /*can*/
 FDCAN_TxHeaderTypeDef TxHeader;
-uint8_t TxData[8] = {0,1,2,3,4,5,6,7};
+uint8_t CanTxData[8] = {0,1,2,3,4,5,6,7};
 uint32_t id;
-uint8_t data[8];
+uint8_t CanRxData[8];
 FDCAN_RxHeaderTypeDef RxHeader;
-FDCAN_ErrorCountersTypeDef ErrorCounters;
-uint32_t live_tec=0;
-uint32_t live_rec=0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,16 +122,46 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 		}
 		id = RxHeader.Identifier;
 		if(id == 0x123){
-			data[0] = RxData[0];                                                    // Data
-			data[1] = RxData[1];
-			data[2] = RxData[2];
-			data[3] = RxData[3];
-			data[4] = RxData[4];
-			data[5] = RxData[5];
-			data[6] = RxData[6];
-			data[7] = RxData[7];
+			CanRxData[0] = RxData[0];                                                    // Data
+			CanRxData[1] = RxData[1];
+			CanRxData[2] = RxData[2];
+			CanRxData[3] = RxData[3];
+			CanRxData[4] = RxData[4];
+			CanRxData[5] = RxData[5];
+			CanRxData[6] = RxData[6];
+			CanRxData[7] = RxData[7];
+			CanRxFlag = true;
 		}
 	}
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+	if(huart->Instance==USART1){
+		if(RxChar == '\r'){
+			RxBuffer[RxIndex]='\0';
+			CanTxFlag = true;
+			RxIndex = 0;
+		}else{
+			if(RxIndex < 31){
+				RxBuffer[RxIndex] = RxChar;
+				RxIndex++;
+			}
+		}
+		HAL_UART_Receive_IT(&huart1, &RxChar,1);
+	}
+}
+
+uint32_t parseHex(char* str, int len){
+	uint32_t val = 0;
+	for(int i = 0;i<len;i++){
+		char c = str[i];
+		uint8_t v = 0;
+		if(c >= '0' && c<= '9') v = c - '0';//数字に変換
+		else if(c >= 'A' && c <= 'F') v = c - 'A' + 10;//大文字の16進数も10進数に変換
+		else if(c >= 'a' && c <= 'f') v = c - 'a' + 10;//小文字の16進数も10進数に変換
+		val = (val << 4) | v;
+	}
+	return val;
 }
 /* USER CODE END PFP */
 
@@ -169,6 +206,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   FDCAN_Config();
+  HAL_UART_Receive_IT(&huart1, &RxChar, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -178,22 +216,56 @@ int main(void)
 //	  HAL_UART_Transmit(&huart1, tx_buff, sizeof(tx_buff), 1000);
 //	  printf("aiueo\n");
 		// 1. Bus-Off状態（エラーで強制停止）になっていないかチェック
-	  HAL_FDCAN_GetErrorCounters(&hfdcan1, &ErrorCounters);
-	  live_tec = ErrorCounters.TxErrorCnt;
-	  live_rec = ErrorCounters.RxErrorCnt;
+	  if(CanRxFlag){
+		  char txBuffer[32];
+		  int index = 0;
+		  if(CanRxIde==FDCAN_STANDARD_ID){
+			  index += sprintf(&txBuffer[index], "t%03lX%lu", CanRxId, CanRxDlc);
+		  }else{
+			  index += sprintf(&txBuffer[index], "T%08lX%lu", CanRxId, CanRxDlc);
+		  }
+		  for(int i = 0;i<CanRxDlc;i++){
+			  index += sprintf(&txBuffer[index], "%02X", CanRxData[i]);
+		  }
+		  txBuffer[index++] = '\r';
+		  txBuffer[index] = '\0';
+
+		  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, index, 100);
+		  CanRxFlag=false;
+	  }
+
+	  if(CanTxFlag){
+		  if(RxBuffer[0]=='t'){
+			  TxHeader.IdType = FDCAN_STANDARD_ID;
+			  TxHeader.Identifier = parseHex(&RxBuffer[1],3);
+			  TxHeader.DataLength = parseHex(&RxBuffer[4],1);
+			  for(int i = 0; i < TxHeader.DataLength;i++){
+				  CanTxData[i] = (uint8_t)parseHex(&RxBuffer[5 + (i * 2)], 2);
+			  }
+		  }else if(RxBuffer[0] == 'T'){
+			  TxHeader.IdType = FDCAN_EXTENDED_ID;
+			  TxHeader.Identifier = parseHex(&RxBuffer[1],8);
+			  TxHeader.DataLength = parseHex(&RxBuffer[9],1);
+			  for(int i = 0; i < TxHeader.DataLength;i++){
+				  CanTxData[i] = (uint8_t)parseHex(&RxBuffer[10 + (i * 2)], 2);
+			  }
+		  }
+		  if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0) {
+			  if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, CanTxData) == HAL_OK) {
+				  //送信した時に行いたい処理
+				  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+				  for(uint8_t i = 0; i < 8; i++)CanTxData[i]++;
+			  }
+		  }
+		  CanTxFlag = false;
+	  }
+
+	  // Bus-Offを検知したら、FDCANを一旦停止して再スタート（エラー解除）
 	  if ((hfdcan1.Instance->PSR & FDCAN_PSR_BO) != 0) {
-		  // Bus-Offを検知したら、FDCANを一旦停止して再スタート（エラー解除）
 		  HAL_FDCAN_Stop(&hfdcan1);
 		  HAL_FDCAN_Start(&hfdcan1);
 	  }
-	  if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0) {
-		  if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, TxData) == HAL_OK) {
-			  //送信した時に行いたい処理
-			  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-			  for(uint8_t i = 0; i < 8; i++)TxData[i]++;
-		  }
-	  }
-	  HAL_Delay(100);
+	  HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
